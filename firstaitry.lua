@@ -1,11 +1,14 @@
 --// SERVICES
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
 
+--// PLAYER REFERENCES
 local player = Players.LocalPlayer
 local char = player.Character or player.CharacterAdded:Wait()
 local hrp = char:WaitForChild("HumanoidRootPart")
+local humanoid = char:WaitForChild("Humanoid")
 
 --// WORLD REFERENCES
 local PitchPart = workspace:WaitForChild("Pitch"):WaitForChild("Grass")
@@ -14,184 +17,166 @@ local Ball = BallsFolder:WaitForChild("CBM")
 
 --// SETTINGS
 local DANGER_RADIUS = 35
-local RUSH_GOAL_DISTANCE = 45
-local DECISION_RATE = 0.25
+local AUTO_DEFENSE_DISTANCE = 12 -- distance to rush ball
+local DEFENSIVE_BEHIND = 5      -- stay behind attacker toward own goal
+local ANGLE_OFFSET = 0.3        -- lateral offset
+local SPEED_BOOST = 24
+local NORMAL_SPEED = 16
+local HALF_LINE_Z = 0
+local STOP_SCRIPT = false
 
---// PASS FUNCTION (AUTO SELECT BEST ATTACKER)
-local function getBestForward()
-    local bestPlayer = nil
-    local bestScore = -math.huge
+--// GOAL POSITIONS
+local AWAY_GOAL_POS = Vector3.new(2,5.32,349)
+local HOME_GOAL_POS = Vector3.new(2,5,-349)
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player and plr.Team == player.Team then
-            if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
-                
-                local teammatePos = plr.Character.HumanoidRootPart.Position
-                
-                -- Distance from nearest opponent
-                local closestOpp = math.huge
-                for _, opp in ipairs(Players:GetPlayers()) do
-                    if opp.Team ~= player.Team and opp.Character and opp.Character:FindFirstChild("HumanoidRootPart") then
-                        local dist = (opp.Character.HumanoidRootPart.Position - teammatePos).Magnitude
-                        if dist < closestOpp then
-                            closestOpp = dist
-                        end
-                    end
-                end
-
-                -- Closer to opponent goal = better
-                local goalZ = PitchPart.Position.Z + PitchPart.Size.Z/2
-                local attackScore = math.abs(goalZ - teammatePos.Z)
-
-                local score = closestOpp * 1.5 - attackScore
-
-                if score > bestScore then
-                    bestScore = score
-                    bestPlayer = plr
-                end
-            end
-        end
-    end
-
-    return bestPlayer
+local myGoalPos, opponentGoalPos
+if player.Team.Name == "Home" then
+    myGoalPos = HOME_GOAL_POS
+    opponentGoalPos = AWAY_GOAL_POS
+else
+    myGoalPos = AWAY_GOAL_POS
+    opponentGoalPos = HOME_GOAL_POS
 end
 
+-- Stop script
+UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.F4 then
+        STOP_SCRIPT = true
+    end
+end)
+
+-- Move helper
+local function moveTo(pos)
+    humanoid:MoveTo(pos)
+end
+local function jump()
+    humanoid.Jump = true
+end
+
+-- Auto-pass
+local function getBestForward()
+    local bestPlayer, bestScore = nil, -math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Team == player.Team and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            local pos = plr.Character.HumanoidRootPart.Position
+            local closestOpp = math.huge
+            for _, opp in ipairs(Players:GetPlayers()) do
+                if opp.Team ~= player.Team and opp.Character and opp.Character:FindFirstChild("HumanoidRootPart") then
+                    local d = (opp.Character.HumanoidRootPart.Position - pos).Magnitude
+                    if d < closestOpp then closestOpp = d end
+                end
+            end
+            local score = closestOpp*1.5 - (opponentGoalPos - pos).Magnitude
+            if score > bestScore then bestScore = score bestPlayer = plr end
+        end
+    end
+    return bestPlayer
+end
 local function autoPass()
     local target = getBestForward()
     if not target then return end
-
-    local targetHRP = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    local targetHRP = target.Character:FindFirstChild("HumanoidRootPart")
     if not targetHRP then return end
-
-    local part = Ball
-
-    if part:FindFirstChild("Owner") and part.Owner.Value ~= player then
-        return
-    end
-
-    local duration = 1.6
-
+    if Ball:FindFirstChild("Owner") and Ball.Owner.Value ~= player then return end
     local bv = Instance.new("BodyVelocity")
     bv.MaxForce = Vector3.new(1e5,1e5,1e5)
-    bv.Velocity = (targetHRP.Position - part.Position) / duration
-    bv.Parent = part
-    game.Debris:AddItem(bv, 0.4)
+    bv.Velocity = (targetHRP.Position - Ball.Position)/1.6
+    bv.Parent = Ball
+    Debris:AddItem(bv,0.4)
 end
 
---// HELPER: GET PLAYERS NEAR BALL
-local function getPlayersNearBall(radius)
-    local attackers = {}
-    local defenders = {}
+-- Defensive position behind attacker
+local function defensivePosition(attackerHRP)
+    local dirToGoal = (myGoalPos - attackerHRP.Position).Unit
+    local right = Vector3.new(-dirToGoal.Z,0,dirToGoal.X)
+    local pos = attackerHRP.Position + dirToGoal*DEFENSIVE_BEHIND + right*ANGLE_OFFSET
+    -- clamp inside own half
+    if player.Team.Name=="Home" and pos.Z>HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z-1) end
+    if player.Team.Name=="Away" and pos.Z<HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z+1) end
+    return pos
+end
 
+-- Defensive midpoint for 2 attackers
+local function defensiveMidpoint(att1HRP, att2HRP)
+    local mid = (att1HRP.Position + att2HRP.Position)/2
+    local dirToGoal = (myGoalPos - mid).Unit
+    local right = Vector3.new(-dirToGoal.Z,0,dirToGoal.X)
+    local pos = mid + dirToGoal*DEFENSIVE_BEHIND + right*ANGLE_OFFSET
+    if player.Team.Name=="Home" and pos.Z>HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z-1) end
+    if player.Team.Name=="Away" and pos.Z<HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z+1) end
+    return pos
+end
+
+-- Players near ball
+local function playersNearBall(radius)
+    local attackers, defenders = {}, {}
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
-            local dist = (plr.Character.HumanoidRootPart.Position - Ball.Position).Magnitude
-            
-            if dist <= radius then
-                if plr.Team ~= player.Team then
-                    table.insert(attackers, plr)
-                else
-                    table.insert(defenders, plr)
-                end
+            local d = (plr.Character.HumanoidRootPart.Position - Ball.Position).Magnitude
+            if d<=radius then
+                if plr.Team ~= player.Team then table.insert(attackers,plr)
+                else table.insert(defenders,plr) end
             end
         end
     end
-
     return attackers, defenders
 end
 
---// MOVEMENT CONTROLLER
-local function moveTo(position)
-    char.Humanoid:MoveTo(position)
-end
-
---// AI LOOP
-local lastDecision = 0
-
-RunService.RenderStepped:Connect(function()
-
-    if tick() - lastDecision < DECISION_RATE then return end
-    lastDecision = tick()
-
+-- Main AI loop
+RunService.Heartbeat:Connect(function()
+    if STOP_SCRIPT then return end
     if not Ball then return end
 
-    local attackers, defenders = getPlayersNearBall(DANGER_RADIUS)
-    local numAttackers = #attackers
-    local numDefenders = #defenders
+    local attackers, defenders = playersNearBall(DANGER_RADIUS)
+    for i,v in ipairs(defenders) do if v==player then table.remove(defenders,i) break end end
+    local numAttackers=#attackers
+    local numDefenders=#defenders+1
 
-    -- Remove self from defenders count
-    for i,v in ipairs(defenders) do
-        if v == player then
-            table.remove(defenders, i)
-            break
-        end
-    end
+    humanoid.WalkSpeed=SPEED_BOOST
 
-    numDefenders = #defenders + 1 -- include self logically
-
-    -- Determine goal side
-    local pitchCenterZ = PitchPart.Position.Z
-    local defendingRight = Ball.Position.Z > pitchCenterZ
-
-    local myGoalZ
-    if defendingRight then
-        myGoalZ = PitchPart.Position.Z - PitchPart.Size.Z/2
-    else
-        myGoalZ = PitchPart.Position.Z + PitchPart.Size.Z/2
-    end
-
-    local ballDistToGoal = math.abs(Ball.Position.Z - myGoalZ)
-
-    -------------------------------------------------
-    -- 1v1 → RUSH
-    -------------------------------------------------
-    if numAttackers == 1 and numDefenders == 1 then
-        moveTo(Ball.Position)
-    end
-
-    -------------------------------------------------
-    -- 2v1 → HOLD MIDDLE
-    -------------------------------------------------
-    if numAttackers == 2 and numDefenders == 1 then
-        
-        local pos1 = attackers[1].Character.HumanoidRootPart.Position
-        local pos2 = attackers[2].Character.HumanoidRootPart.Position
-        local midpoint = (pos1 + pos2) / 2
-
-        if ballDistToGoal < RUSH_GOAL_DISTANCE then
-            moveTo(Ball.Position) -- rush near goal
+    -- 1v1
+    if numAttackers==1 and numDefenders==1 then
+        local attHRP=attackers[1].Character.HumanoidRootPart
+        local dist=(attHRP.Position-hrp.Position).Magnitude
+        if dist<=AUTO_DEFENSE_DISTANCE then
+            moveTo(Ball.Position)
+            jump()
+            autoPass()
+            jump()
         else
-            moveTo(midpoint)
+            moveTo(defensivePosition(attHRP))
         end
     end
 
-    -------------------------------------------------
-    -- 2v2 → MARK CLOSEST
-    -------------------------------------------------
-    if numAttackers == 2 and numDefenders >= 2 then
-        
-        local closestAttacker = nil
-        local closestDist = math.huge
-
-        for _, attacker in ipairs(attackers) do
-            local dist = (attacker.Character.HumanoidRootPart.Position - hrp.Position).Magnitude
-            if dist < closestDist then
-                closestDist = dist
-                closestAttacker = attacker
-            end
-        end
-
-        if closestAttacker then
-            moveTo(closestAttacker.Character.HumanoidRootPart.Position)
+    -- 2v1
+    if numAttackers==2 and numDefenders==1 then
+        local att1=attackers[1].Character.HumanoidRootPart
+        local att2=attackers[2].Character.HumanoidRootPart
+        local distToBall=(Ball.Position-hrp.Position).Magnitude
+        if distToBall<=AUTO_DEFENSE_DISTANCE then
+            moveTo(Ball.Position)
+            jump()
+            autoPass()
+            jump()
+        else
+            moveTo(defensiveMidpoint(att1,att2))
         end
     end
 
-    -------------------------------------------------
-    -- IF WE WIN BALL → AUTO PASS
-    -------------------------------------------------
-    if Ball:FindFirstChild("Owner") and Ball.Owner.Value == player then
+    -- 2v2
+    if numAttackers==2 and numDefenders>=2 then
+        local closestAtt, closestDist=nil,math.huge
+        for _,att in ipairs(attackers) do
+            local d=(att.Character.HumanoidRootPart.Position-hrp.Position).Magnitude
+            if d<closestDist then closestDist=d closestAtt=att end
+        end
+        if closestAtt then
+            moveTo(defensivePosition(closestAtt.Character.HumanoidRootPart))
+        end
+    end
+
+    -- Auto-pass if we own ball
+    if Ball:FindFirstChild("Owner") and Ball.Owner.Value==player then
         autoPass()
     end
-
-
 end)
