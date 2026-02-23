@@ -10,7 +10,7 @@ local hrp = char:WaitForChild("HumanoidRootPart")
 --// WORLD REFERENCES
 local PitchPart = workspace:WaitForChild("Pitch"):WaitForChild("Grass")
 local BallsFolder = workspace:WaitForChild("Balls")
-local Ball = BallsFolder:WaitForChild("VEF")
+local Ball = BallsFolder:WaitForChild("CBM")
 
 --// SETTINGS
 local DANGER_RADIUS = 35
@@ -192,5 +192,6 @@ RunService.RenderStepped:Connect(function()
     if Ball:FindFirstChild("Owner") and Ball.Owner.Value == player then
         autoPass()
     end
+
 
 end)
