@@ -13,13 +13,17 @@ local humanoid = char:WaitForChild("Humanoid")
 --// WORLD REFERENCES
 local PitchPart = workspace:WaitForChild("Pitch"):WaitForChild("Grass")
 local BallsFolder = workspace:WaitForChild("Balls")
-local Ball = BallsFolder:WaitForChild("CBM")
+local Ball = BallsFolder:FindFirstChild("CBM")
+if not Ball then
+    warn("CBM ball not found in Balls folder!")
+    return
+end
 
 --// SETTINGS
 local DANGER_RADIUS = 35
-local AUTO_DEFENSE_DISTANCE = 12 -- distance to rush ball
-local DEFENSIVE_BEHIND = 5      -- stay behind attacker toward own goal
-local ANGLE_OFFSET = 0.3        -- lateral offset
+local AUTO_DEFENSE_DISTANCE = 8.4      -- distance to rush the ball
+local DEFENSIVE_BEHIND = 7.5         -- stay behind attacker toward own goal
+local ANGLE_OFFSET = 0.3             -- slight lateral offset
 local SPEED_BOOST = 24
 local NORMAL_SPEED = 16
 local HALF_LINE_Z = 0
@@ -28,7 +32,6 @@ local STOP_SCRIPT = false
 --// GOAL POSITIONS
 local AWAY_GOAL_POS = Vector3.new(2,5.32,349)
 local HOME_GOAL_POS = Vector3.new(2,5,-349)
-
 local myGoalPos, opponentGoalPos
 if player.Team.Name == "Home" then
     myGoalPos = HOME_GOAL_POS
@@ -45,15 +48,10 @@ UserInputService.InputBegan:Connect(function(input)
     end
 end)
 
--- Move helper
-local function moveTo(pos)
-    humanoid:MoveTo(pos)
-end
-local function jump()
-    humanoid.Jump = true
-end
+-- HELPER FUNCTIONS
+local function moveTo(pos) humanoid:MoveTo(pos) end
+local function jump() humanoid.Jump = true end
 
--- Auto-pass
 local function getBestForward()
     local bestPlayer, bestScore = nil, -math.huge
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -72,6 +70,7 @@ local function getBestForward()
     end
     return bestPlayer
 end
+
 local function autoPass()
     local target = getBestForward()
     if not target then return end
@@ -82,101 +81,123 @@ local function autoPass()
     bv.MaxForce = Vector3.new(1e5,1e5,1e5)
     bv.Velocity = (targetHRP.Position - Ball.Position)/1.6
     bv.Parent = Ball
-    Debris:AddItem(bv,0.4)
+    Debris:AddItem(bv, 0.4)
 end
 
--- Defensive position behind attacker
+-- Defensive shadowing: stay behind attacker toward own goal
 local function defensivePosition(attackerHRP)
     local dirToGoal = (myGoalPos - attackerHRP.Position).Unit
-    local right = Vector3.new(-dirToGoal.Z,0,dirToGoal.X)
-    local pos = attackerHRP.Position + dirToGoal*DEFENSIVE_BEHIND + right*ANGLE_OFFSET
-    -- clamp inside own half
-    if player.Team.Name=="Home" and pos.Z>HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z-1) end
-    if player.Team.Name=="Away" and pos.Z<HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z+1) end
-    return pos
+    local targetPos = attackerHRP.Position + dirToGoal * DEFENSIVE_BEHIND
+    local right = Vector3.new(-dirToGoal.Z, 0, dirToGoal.X)
+    targetPos = targetPos + right * ANGLE_OFFSET
+
+    if player.Team.Name == "Home" and targetPos.Z > HALF_LINE_Z then
+        targetPos = Vector3.new(targetPos.X, targetPos.Y, HALF_LINE_Z - 1)
+    elseif player.Team.Name == "Away" and targetPos.Z < HALF_LINE_Z then
+        targetPos = Vector3.new(targetPos.X, targetPos.Y, HALF_LINE_Z + 1)
+    end
+    return targetPos
 end
 
--- Defensive midpoint for 2 attackers
 local function defensiveMidpoint(att1HRP, att2HRP)
     local mid = (att1HRP.Position + att2HRP.Position)/2
     local dirToGoal = (myGoalPos - mid).Unit
+    local targetPos = mid + dirToGoal * DEFENSIVE_BEHIND
     local right = Vector3.new(-dirToGoal.Z,0,dirToGoal.X)
-    local pos = mid + dirToGoal*DEFENSIVE_BEHIND + right*ANGLE_OFFSET
-    if player.Team.Name=="Home" and pos.Z>HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z-1) end
-    if player.Team.Name=="Away" and pos.Z<HALF_LINE_Z then pos=Vector3.new(pos.X,pos.Y,HALF_LINE_Z+1) end
-    return pos
+    targetPos = targetPos + right * ANGLE_OFFSET
+
+    if player.Team.Name == "Home" and targetPos.Z > HALF_LINE_Z then
+        targetPos = Vector3.new(targetPos.X, targetPos.Y, HALF_LINE_Z - 1)
+    elseif player.Team.Name == "Away" and targetPos.Z < HALF_LINE_Z then
+        targetPos = Vector3.new(targetPos.X, targetPos.Y, HALF_LINE_Z + 1)
+    end
+    return targetPos
 end
 
--- Players near ball
 local function playersNearBall(radius)
-    local attackers, defenders = {}, {}
+    local attackers, defenders = {},{}
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
             local d = (plr.Character.HumanoidRootPart.Position - Ball.Position).Magnitude
-            if d<=radius then
-                if plr.Team ~= player.Team then table.insert(attackers,plr)
-                else table.insert(defenders,plr) end
+            if d <= radius then
+                if plr.Team ~= player.Team then
+                    table.insert(attackers, plr)
+                else
+                    table.insert(defenders, plr)
+                end
             end
         end
     end
     return attackers, defenders
 end
 
--- Main AI loop
+-- Track ball ownership for 1 second follow
+local ballOwnedAt = 0
+local followingBall = false
+
+-- MAIN LOOP
 RunService.Heartbeat:Connect(function()
     if STOP_SCRIPT then return end
     if not Ball then return end
 
+    local ballHeight = Ball.Position.Y - PitchPart.Position.Y
+    local shouldJump = ballHeight >= 2
+
     local attackers, defenders = playersNearBall(DANGER_RADIUS)
     for i,v in ipairs(defenders) do if v==player then table.remove(defenders,i) break end end
-    local numAttackers=#attackers
-    local numDefenders=#defenders+1
+    local numAttackers = #attackers
+    local numDefenders = #defenders + 1
 
-    humanoid.WalkSpeed=SPEED_BOOST
+    humanoid.WalkSpeed = SPEED_BOOST
 
-    -- 1v1
-    if numAttackers==1 and numDefenders==1 then
-        local attHRP=attackers[1].Character.HumanoidRootPart
-        local dist=(attHRP.Position-hrp.Position).Magnitude
-        if dist<=AUTO_DEFENSE_DISTANCE then
-            moveTo(Ball.Position)
-            jump()
-            autoPass()
-            jump()
+    local hasBall = Ball:FindFirstChild("Owner") and Ball.Owner.Value == player
+
+    -- Find nearest attacker
+    local closestAttacker, closestDist = nil, math.huge
+    for _, att in ipairs(attackers) do
+        local d = (att.Character.HumanoidRootPart.Position - Ball.Position).Magnitude
+        if d < closestDist then
+            closestDist = d
+            closestAttacker = att
+        end
+    end
+
+    local distToBall = (Ball.Position - hrp.Position).Magnitude
+    local closerThanAttacker = closestAttacker and distToBall < closestDist
+
+    -- RUSH the ball if within 7 studs OR closer than nearest attacker
+    local shouldRush = distToBall <= AUTO_DEFENSE_DISTANCE or closerThanAttacker
+
+    if shouldRush then
+        if shouldJump then jump() end
+        moveTo(Ball.Position)
+
+        if hasBall then
+            if not followingBall then
+                followingBall = true
+                ballOwnedAt = tick()
+            end
+            if tick() - ballOwnedAt >= 1 then
+                autoPass()
+                followingBall = false
+            end
         else
-            moveTo(defensivePosition(attHRP))
+            followingBall = false
         end
+        return
     end
 
-    -- 2v1
-    if numAttackers==2 and numDefenders==1 then
-        local att1=attackers[1].Character.HumanoidRootPart
-        local att2=attackers[2].Character.HumanoidRootPart
-        local distToBall=(Ball.Position-hrp.Position).Magnitude
-        if distToBall<=AUTO_DEFENSE_DISTANCE then
-            moveTo(Ball.Position)
-            jump()
-            autoPass()
-            jump()
-        else
-            moveTo(defensiveMidpoint(att1,att2))
+    -- DEFENSIVE SHADOWING
+    if numAttackers == 1 and numDefenders == 1 then
+        local targetPos = defensivePosition(attackers[1].Character.HumanoidRootPart)
+        moveTo(targetPos)
+    elseif numAttackers == 2 and numDefenders == 1 then
+        local targetPos = defensiveMidpoint(attackers[1].Character.HumanoidRootPart, attackers[2].Character.HumanoidRootPart)
+        moveTo(targetPos)
+    elseif numAttackers == 2 and numDefenders >= 2 then
+        if closestAttacker then
+            local targetPos = defensivePosition(closestAttacker.Character.HumanoidRootPart)
+            moveTo(targetPos)
         end
-    end
-
-    -- 2v2
-    if numAttackers==2 and numDefenders>=2 then
-        local closestAtt, closestDist=nil,math.huge
-        for _,att in ipairs(attackers) do
-            local d=(att.Character.HumanoidRootPart.Position-hrp.Position).Magnitude
-            if d<closestDist then closestDist=d closestAtt=att end
-        end
-        if closestAtt then
-            moveTo(defensivePosition(closestAtt.Character.HumanoidRootPart))
-        end
-    end
-
-    -- Auto-pass if we own ball
-    if Ball:FindFirstChild("Owner") and Ball.Owner.Value==player then
-        autoPass()
     end
 end)
